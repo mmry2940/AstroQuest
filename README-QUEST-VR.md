@@ -230,8 +230,16 @@ out of `bachatas4-0.2.4-release.apk`, which therefore has to stay in this folder
 
 ```sh
 adb install -r build/quest/astro-vr-host.apk
-adb push games/CUSA12392 /data/local/tmp/astro/games/        # 13 GB, a few minutes
+# Optional: copy the game by USB instead of importing it in the app.
+adb push games/CUSA12392 /data/local/tmp/astro/games/
 ```
+
+If the app does not find the game, it opens Android's folder picker. Choose the extracted game
+folder itself, or a parent folder up to three levels above it; the app imports the folder
+containing `eboot.bin` into its own `games` directory before starting. Allow enough free headset
+storage for another copy of the game (about 13 GB). You can still put the game in the app's
+`games` folder or use the USB `adb push` location above instead. The imported copy is in
+app-specific storage and is removed if the app is uninstalled.
 
 To play with a gamepad, pair it with the headset (Settings ▸ Bluetooth; on a DualSense, hold
 Create + PS until the light bar flashes); the headset's own controllers need nothing. Then start

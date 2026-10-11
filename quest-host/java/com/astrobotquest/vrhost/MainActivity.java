@@ -3,7 +3,9 @@ package com.astrobotquest.vrhost;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -19,6 +21,7 @@ import android.hardware.lights.Light;
 import android.hardware.lights.LightState;
 import android.hardware.lights.LightsManager;
 import android.hardware.lights.LightsRequest;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.CombinedVibration;
@@ -27,6 +30,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.VibratorManager;
+import android.provider.DocumentsContract;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -37,6 +41,8 @@ import android.view.WindowManager;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -86,6 +92,7 @@ public class MainActivity extends Activity
     private static final int RUMBLE_MILLIS = 1000, RUMBLE_RENEW_MILLIS = 400;
 
     private static final int REQUEST_MICROPHONE = 1;
+    private static final int REQUEST_GAME_FOLDER = 2;
 
     static {
         System.loadLibrary("astrovr");
@@ -176,6 +183,7 @@ public class MainActivity extends Activity
     private View inputView;
     private volatile String setupStatus = "Starting...";
     private volatile boolean setupFailed;
+    private boolean gameFolderPickerRequested;
     private String shownStatus = "";
 
     // Controller state.
@@ -338,6 +346,21 @@ public class MainActivity extends Activity
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED
                             ? "allowed" : "not allowed"));
         }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_GAME_FOLDER) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            setupStatus = "No game folder selected. Restart the app to choose one.";
+            return;
+        }
+        Uri tree = data.getData();
+        setupStatus = "Finding eboot.bin in the selected folder...";
+        new Thread(() -> importGameFolder(tree), "game-import").start();
     }
 
     /** Called by the native side when the headset session is over and will not come back. */
@@ -640,7 +663,12 @@ public class MainActivity extends Activity
                 setupFailed = true;
                 setupStatus = "No game found.\n\nCopy the extracted game folder (the one that "
                         + "contains eboot.bin) to the headset, to either of\n" + games
-                        + "/CUSA12392\n" + SHELL_GAMES + "/CUSA12392\nthen start this app again.";
+                        + "/CUSA12392\n" + SHELL_GAMES + "/CUSA12392\n\nA folder picker will "
+                        + "open so you can choose and import it.";
+                if (!dryRun && !gameFolderPickerRequested) {
+                    gameFolderPickerRequested = true;
+                    handler.post(this::chooseGameFolder);
+                }
                 return;
             }
 
@@ -758,6 +786,226 @@ public class MainActivity extends Activity
             }
         }
         return null;
+    }
+
+    private void chooseGameFolder() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, REQUEST_GAME_FOLDER);
+        } catch (android.content.ActivityNotFoundException e) {
+            setupFailed = true;
+            setupStatus = "The Android folder picker is not available. Copy the extracted game "
+                    + "folder (the one containing eboot.bin) to "
+                    + new File(getExternalFilesDir(null), "games")
+                    + " and restart the app.";
+            logWarning("unable to open the game folder picker", e);
+        }
+    }
+
+    private void importGameFolder(Uri tree) {
+        File destination = null;
+        try {
+            String rootId = DocumentsContract.getTreeDocumentId(tree);
+            String gameId = findEbootFolder(tree, rootId, 0);
+            if (gameId == null) {
+                throw new IOException("The selected folder does not contain eboot.bin "
+                        + "within three subfolders.");
+            }
+
+            String gameName = findDocumentName(tree, rootId, gameId);
+            File external = getExternalFilesDir(null);
+            if (external == null) {
+                throw new IOException("The headset's app storage is not available.");
+            }
+            File games = new File(external, "games");
+            if (!games.isDirectory() && !games.mkdirs()) {
+                throw new IOException("Could not create the app's games folder: " + games);
+            }
+            destination = uniqueImportFolder(games, gameName);
+            if (!destination.mkdir()) {
+                throw new IOException("Could not create the import folder: " + destination);
+            }
+            setupStatus = "Importing game files into the app...";
+            copyDocumentFolder(tree, gameId, destination, new long[] {0});
+            setupStatus = "Game imported. Starting...";
+            setupFailed = false;
+            new Thread(this::setUpAndStart, "setup").start();
+        } catch (IOException | SecurityException e) {
+            if (destination != null && destination.exists() && !deleteTree(destination)) {
+                logWarning("could not remove an incomplete game import: " + destination, null);
+            }
+            logWarning("game folder import failed", e);
+            setupFailed = true;
+            setupStatus = "Could not import the game folder:\n" + e.getMessage()
+                    + "\n\nChoose the folder containing eboot.bin, or copy the game to "
+                    + new File(getExternalFilesDir(null), "games") + " and restart.";
+        }
+    }
+
+    private String findEbootFolder(Uri tree, String documentId, int depth) throws IOException {
+        List<TreeEntry> children = listChildren(tree, documentId);
+        for (TreeEntry child : children) {
+            if ("eboot.bin".equalsIgnoreCase(child.name)
+                    && !DocumentsContract.Document.MIME_TYPE_DIR.equals(child.mimeType)) {
+                return documentId;
+            }
+        }
+        if (depth >= 3) {
+            return null;
+        }
+        for (TreeEntry child : children) {
+            if (DocumentsContract.Document.MIME_TYPE_DIR.equals(child.mimeType)) {
+                String found = findEbootFolder(tree, child.id, depth + 1);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String findDocumentName(Uri tree, String parentId, String wantedId)
+            throws IOException {
+        String name = findDocumentNameOrNull(tree, parentId, wantedId);
+        if (name == null) {
+            throw new IOException("The selected game folder could not be read.");
+        }
+        return name;
+    }
+
+    private String findDocumentNameOrNull(Uri tree, String parentId, String wantedId)
+            throws IOException {
+        if (parentId.equals(wantedId)) {
+            Uri document = DocumentsContract.buildDocumentUriUsingTree(tree, parentId);
+            try (Cursor cursor = getContentResolver().query(document,
+                    new String[] {DocumentsContract.Document.COLUMN_DISPLAY_NAME},
+                    null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    return cursor.getString(0);
+                }
+            }
+            return "Imported Game";
+        }
+        for (TreeEntry child : listChildren(tree, parentId)) {
+            if (child.id.equals(wantedId)) {
+                return child.name;
+            }
+            if (DocumentsContract.Document.MIME_TYPE_DIR.equals(child.mimeType)) {
+                String found = findDocumentNameOrNull(tree, child.id, wantedId);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<TreeEntry> listChildren(Uri tree, String documentId) throws IOException {
+        Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, documentId);
+        String[] columns = {
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+        };
+        List<TreeEntry> children = new ArrayList<>();
+        try (Cursor cursor = getContentResolver().query(childrenUri, columns, null, null, null)) {
+            if (cursor == null) {
+                throw new IOException("The selected folder could not be read.");
+            }
+            int idColumn = cursor.getColumnIndexOrThrow(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID);
+            int nameColumn = cursor.getColumnIndexOrThrow(
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+            int typeColumn = cursor.getColumnIndexOrThrow(
+                    DocumentsContract.Document.COLUMN_MIME_TYPE);
+            while (cursor.moveToNext()) {
+                children.add(new TreeEntry(cursor.getString(idColumn),
+                        cursor.getString(nameColumn), cursor.getString(typeColumn)));
+            }
+        } catch (IllegalArgumentException e) {
+            throw new IOException("The selected folder provider returned invalid data.", e);
+        }
+        return children;
+    }
+
+    private void copyDocumentFolder(Uri tree, String documentId, File target, long[] copiedBytes)
+            throws IOException {
+        for (TreeEntry child : listChildren(tree, documentId)) {
+            String name = child.name;
+            if (name == null || name.isEmpty() || name.equals(".") || name.equals("..")
+                    || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
+                throw new IOException("The selected folder contains an invalid file name.");
+            }
+            File output = new File(target, name);
+            if (DocumentsContract.Document.MIME_TYPE_DIR.equals(child.mimeType)) {
+                if (!output.mkdir()) {
+                    throw new IOException("Could not create folder: " + output);
+                }
+                copyDocumentFolder(tree, child.id, output, copiedBytes);
+                continue;
+            }
+            Uri document = DocumentsContract.buildDocumentUriUsingTree(tree, child.id);
+            try (InputStream input = getContentResolver().openInputStream(document);
+                    OutputStream stream = new FileOutputStream(output)) {
+                if (input == null) {
+                    throw new IOException("Could not read " + name + " from the selected folder.");
+                }
+                byte[] buffer = new byte[1024 * 1024];
+                int count;
+                while ((count = input.read(buffer)) != -1) {
+                    stream.write(buffer, 0, count);
+                    copiedBytes[0] += count;
+                    if ((copiedBytes[0] & ((128L * 1024 * 1024) - 1)) < count) {
+                        setupStatus = "Importing game files... "
+                                + copiedBytes[0] / (1024 * 1024) + " MB copied";
+                    }
+                }
+            } catch (SecurityException e) {
+                throw new IOException("Permission to read " + name + " was denied.", e);
+            }
+        }
+    }
+
+    private static File uniqueImportFolder(File games, String requestedName) {
+        String name = requestedName == null ? "" : requestedName.trim();
+        name = name.replaceAll("[\\\\/:*?\"<>|]", "_");
+        if (name.isEmpty() || name.equals(".") || name.equals("..")) {
+            name = "Imported Game";
+        }
+        if (name.length() > 100) {
+            name = name.substring(0, 100);
+        }
+        File folder = new File(games, name);
+        for (int suffix = 2; folder.exists(); suffix++) {
+            folder = new File(games, name + " (" + suffix + ")");
+        }
+        return folder;
+    }
+
+    private static boolean deleteTree(File folder) {
+        File[] children = folder.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                if (child.isDirectory() ? !deleteTree(child) : !child.delete()) {
+                    return false;
+                }
+            }
+        }
+        return folder.delete();
+    }
+
+    private static final class TreeEntry {
+        final String id;
+        final String name;
+        final String mimeType;
+
+        TreeEntry(String id, String name, String mimeType) {
+            this.id = id;
+            this.name = name;
+            this.mimeType = mimeType;
+        }
     }
 
     // --- status panel ---------------------------------------------------------------------------

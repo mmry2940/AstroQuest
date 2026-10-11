@@ -91,6 +91,11 @@ Download `AstroQuest-<version>-Quest3.apk` from the
    The app also finds it in `/sdcard/Android/data/com.astrobotquest.vrhost/files/games/CUSA12392`,
    but that folder is deleted with the app if it is ever uninstalled.
 
+   If the app cannot find the game, it opens a folder picker. Choose the extracted game folder
+   or a parent folder up to three levels above it; the app imports the folder containing
+   `eboot.bin` into its own storage, which needs about 13 GB free for the extra copy. The import
+   is deleted if the app is uninstalled.
+
    **If your game is a `.pkg` file**, unpack it on a PC first: the headset needs the game's
    folder. Two ways:
 
